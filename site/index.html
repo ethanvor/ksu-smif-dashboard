@@ -5,7 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>KSU SMIF · Portfolio Dashboard</title>
 <meta name="description" content="Kennesaw State University Student Managed Investment Fund — live portfolio dashboard and trade simulator." />
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23FFC629'/%3E%3Cpath d='M14 44l10-12 8 6 16-20' stroke='%23111' stroke-width='6' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+<link rel="icon" type="image/svg+xml" href="img/ks.svg" />
+<link rel="apple-touch-icon" href="img/ks.svg" />
+<meta name="theme-color" content="#0c0b0a" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700;800;900&family=Source+Serif+4:ital,wght@1,600&display=swap" rel="stylesheet" />
@@ -21,23 +23,24 @@
 <header class="top">
   <div class="top-inner">
     <a class="brand" href="#overview" data-go="overview">
-      <div class="brand-mark">SMIF</div>
+      <img class="brand-mark" src="img/ks.svg" alt="Kennesaw State University" width="44" height="42" />
       <div class="brand-text"><b>KSU SMIF</b><span>Student Managed Investment Fund</span></div>
     </a>
-    <nav class="tabs" id="tabs">
-      <button data-view="overview" class="active">Overview</button>
-      <button data-view="allocation">Weighting</button>
-      <button data-view="performance">Gain Since Buy</button>
-      <button data-view="risk">Risk</button>
-      <button data-view="holdings">Holdings</button>
-      <button data-view="screener">Screener &amp; Trade Lab</button>
-      <button data-view="data">Master Copy</button>
+    <nav class="tabs" id="tabs" aria-label="Dashboard sections">
+      <button data-view="overview" class="active"><span class="l">Overview</span><span class="s">Overview</span></button>
+      <button data-view="allocation"><span class="l">Weighting</span><span class="s">Weights</span></button>
+      <button data-view="performance"><span class="l">Gain Since Buy</span><span class="s">Gains</span></button>
+      <button data-view="risk"><span class="l">Risk</span><span class="s">Risk</span></button>
+      <button data-view="holdings"><span class="l">Holdings</span><span class="s">Holdings</span></button>
+      <button data-view="screener"><span class="l">Screener &amp; Trade Lab</span><span class="s">Trade Lab</span></button>
+      <button data-view="data"><span class="l">Master Copy</span><span class="s">Master</span></button>
     </nav>
     <div class="top-right">
       <span class="pill snap" id="statusPill"><span class="dot"></span><span id="statusText">Loading…</span></span>
       <button class="btn sm" id="refreshBtn" title="Refresh live prices">↻ Refresh</button>
     </div>
   </div>
+  <div class="tape" id="tape" aria-label="Holdings ticker"><div class="tape-track" id="tapeTrack"></div></div>
 </header>
 
 <main>
@@ -45,14 +48,18 @@
 <section class="view active" id="view-overview">
   <div class="page-head">
     <div>
-      <div class="eyebrow">Kennesaw State University · Coles College of Business</div>
+      <div class="lockup">
+        <img src="img/ks.svg" alt="" width="58" height="55" />
+        <div><b>KENNESAW STATE</b><b class="u">UNIVERSITY</b><span>COLES COLLEGE OF BUSINESS</span><em>Student Managed Investment Fund</em></div>
+      </div>
       <h1>Portfolio <em>overview</em></h1>
       <div class="sub" id="ovSub">The whole fund on one page — value, today's move, what we own and how it's spread out.</div>
     </div>
   </div>
 
   <div class="hero">
-    <div class="card glow hero-main">
+    <div class="card glow hero-main tilt">
+      <img class="hero-owl" src="img/owl.svg" alt="" aria-hidden="true" />
       <div class="hero-label">Total assets under management</div>
       <div class="hero-value num" id="heroValue">—</div>
       <div class="row"><span class="chg" id="heroChg">—</span><span style="color:var(--muted);font-size:13px" id="heroVs"></span></div>
@@ -67,7 +74,10 @@
     <div class="card">
       <div class="card-head"><h2 id="perfTitle">SMIF vs S&amp;P 500</h2>
         <div class="seg" id="perfRange"><button data-v="1M">1M</button><button data-v="3M">3M</button><button data-v="6M">6M</button><button data-v="YTD">YTD</button><button data-v="1Y" class="on">1Y</button><button data-v="3Y">3Y</button><button data-v="5Y">5Y</button></div></div>
-      <div class="row" id="perfStats" style="gap:22px;margin:-4px 0 6px;font-size:13px;color:var(--ink-2)"></div>
+      <div class="row" style="justify-content:space-between;margin:-4px 0 6px">
+        <div class="row" id="perfStats" style="gap:22px;font-size:13px;color:var(--ink-2)"></div>
+        <div class="seg" id="perfBasis"><button data-v="held" class="on" title="Each stock counts only from the date we bought it">As actually held</button><button data-v="today" title="Today's holdings and weights applied to the whole period">Today's weights</button></div>
+      </div>
       <div id="chPerf" class="chart"></div>
       <div class="hint" id="perfHint" style="color:var(--muted);font-size:12px;margin-top:6px"></div>
     </div>
@@ -184,7 +194,7 @@
     <div class="row">
       <div class="search-box">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
-        <input class="input" id="scrInput" placeholder="Type a ticker or company (e.g. COST, Palantir)…" autocomplete="off" />
+        <input class="input" id="scrInput" placeholder="Ticker or company (e.g. COST)" autocomplete="off" />
         <div class="suggest" id="scrSuggest"></div>
       </div>
       <button class="btn primary" id="scrGo">Analyze</button>
@@ -192,14 +202,14 @@
     <div class="row" style="margin-top:12px"><span style="color:var(--muted);font-size:12px">Watchlist:</span><div class="chips" id="scrChips"></div></div>
   </div>
 
-  <div class="grid g-21 mt" style="align-items:start">
-    <div class="grid" style="gap:18px">
+  <div class="grid g-21 mt scr-grid" style="align-items:start">
+    <div class="grid scr-left" style="gap:18px">
       <div class="card" id="stockCard"><div class="empty"><b>Search a stock to get started</b>Try one from the watchlist above, or any ticker you're pitching.</div></div>
-      <div class="card">
+      <div class="card" id="impactCard">
         <div class="card-head"><h2>Impact on the portfolio</h2><span class="hint">Before → after every trade on the ticket</span></div>
         <div id="impact"><div class="empty">Add a mock trade to see the before/after.</div></div>
       </div>
-      <div class="card"><div class="card-head"><h2>Sector weights: now vs after trades</h2><span class="hint">Equity sleeve, with S&amp;P 500 for reference</span></div><div id="chSim" class="chart tall"></div></div>
+      <div class="card" id="simCard"><div class="card-head"><h2>Sector weights: now vs after trades</h2><span class="hint">Equity sleeve, with S&amp;P 500 for reference</span></div><div id="chSim" class="chart tall"></div></div>
     </div>
     <div class="grid trade-panel" style="gap:18px">
       <div class="card" id="tradeCard">
@@ -286,9 +296,10 @@
   </div>
 </section>
 </main>
-<footer>KSU Student Managed Investment Fund · Market data from Yahoo Finance (delayed, for education only — not investment advice).<br><span id="footMeta"></span></footer>
+<footer><img src="img/owl.svg" alt="" class="foot-owl" /><br>KSU Student Managed Investment Fund · Market data from Yahoo Finance (delayed, for education only — not investment advice).<br><span id="footMeta"></span></footer>
 </div>
 
+<div class="splash" id="splash"><img src="img/owl.svg" alt="" /><div class="splash-bar"><i></i></div><span>Loading the SMIF portfolio…</span></div>
 <div class="modal-bg" id="modal"><div class="modal" id="modalBody"></div></div>
 <div class="toast" id="toast"></div>
 

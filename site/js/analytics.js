@@ -235,6 +235,54 @@ export function windowBacktest(calc, market, rf, startDate, periodsPerYear = 252
   };
 }
 
+/**
+ * "As actually held" estimate: each position only counts from its first purchase date.
+ * Daily return = change in value of the positions we held the day before ÷ their value the day before,
+ * so a new purchase is treated as money coming in, not as a gain (time-weighted return).
+ * Limits: uses current share counts, has no record of positions since sold or of cash changes.
+ */
+export function windowAsHeld(calc, market, startDate) {
+  const spy = market.SPY;
+  if (!spy || !spy.dates?.length) return null;
+  const i0 = spy.dates.findIndex((d) => d >= startDate);
+  if (i0 < 0) return null;
+  const dates = spy.dates.slice(i0);
+  if (dates.length < 3) return null;
+  const spyR = dailyReturns(spy);
+  const pos = [], missing = [], entered = [];
+  calc.rows.forEach((r) => {
+    if (r.assetClass === 'Money Market' || CASH_LIKE.has(r.ticker)) return;
+    const s = market[r.ticker];
+    if (!s || !s.dates?.length) { missing.push(r.ticker); return; }
+    const px = new Map(s.dates.map((d, i) => [d, s.closes[i]]));
+    const start = r.purchaseDate || '1900-01-01';
+    if (start > dates[0]) entered.push({ ticker: r.ticker, date: start });
+    pos.push({ q: +r.quantity, px, start });
+  });
+  let a = 100, b = 100;
+  const smif = [100], bench = [100], held = [];
+  for (let k = 1; k < dates.length; k++) {
+    const d0 = dates[k - 1], d1 = dates[k];
+    let num = 0, den = 0, n = 0;
+    for (const p of pos) {
+      if (p.start > d0) continue; // not owned yet on the previous day
+      const p0 = p.px.get(d0), p1 = p.px.get(d1);
+      if (p0 == null || p1 == null) continue;
+      num += p.q * (p1 - p0); den += p.q * p0; n++;
+    }
+    a *= 1 + (den ? num / den : 0);
+    b *= 1 + (spyR.get(d1) ?? 0);
+    smif.push(+a.toFixed(3)); bench.push(+b.toFixed(3)); held.push(n);
+  }
+  const years = (new Date(dates[dates.length - 1]) - new Date(dates[0])) / (365.25 * 86400000);
+  const ann = (g) => (years >= 1 ? Math.pow(g, 1 / years) - 1 : null);
+  return {
+    dates, smif, bench, missing, partial: [], entered: entered.sort((x, y) => x.date.localeCompare(y.date)), years,
+    smifRet: a / 100 - 1, benchRet: b / 100 - 1, smifAnn: ann(a / 100), benchAnn: ann(b / 100),
+    minHeld: held.length ? Math.min(...held) : 0,
+  };
+}
+
 export function portfolioStats(calc, market, rf) {
   const ps = portfolioSeries(calc, market, rf);
   if (!ps) return null;

@@ -1,6 +1,6 @@
 // KSU SMIF Dashboard — app shell, data loading, views.
 import {
-  computePortfolio, symbolStats, portfolioStats, windowBacktest, applyTrades, periodReturns, weightedBeta,
+  computePortfolio, symbolStats, portfolioStats, windowBacktest, windowAsHeld, applyTrades, periodReturns, weightedBeta,
   fmt, cls, toGics, SECTORS, CASH_LIKE,
 } from './analytics.js';
 
@@ -31,7 +31,7 @@ const S = {
   rfAuto: null,
   settings: { maxPos: 10, band: 5, name: '', ...store.get('settings', {}) },
   view: 'overview',
-  tmColor: 'ret', secBasis: 'equity', perfMode: 'ret', perfRange: store.get('perfRange', '1Y'),
+  tmColor: 'ret', secBasis: 'equity', perfMode: 'ret', perfRange: store.get('perfRange', '1Y'), perfBasis: store.get('perfBasis', 'held'),
   long: {}, longLoaded: false, longLoading: null,
   trades: [],
   stock: null,         // screener current stock
@@ -105,10 +105,38 @@ const axisCommon = {
   axisLabel: { color: C.muted, fontFamily: 'Montserrat, system-ui', fontSize: 11 },
   splitLine: { lineStyle: { color: C.grid } },
 };
-function setChart(id, option) {
+const isMobile = () => window.matchMedia('(max-width: 760px)').matches;
+const SHORT = { 'Information Technology': 'Info Tech', 'Communication Services': 'Comm. Services', 'Consumer Discretionary': 'Cons. Disc.', 'Consumer Staples': 'Cons. Staples', 'Health Care': 'Health Care', 'Fixed Income': 'Fixed Income', 'Money Market': 'Money Mkt' };
+const shortName = (v) => (isMobile() ? SHORT[v] || v : v);
+function setChart(id, option, onClick) {
   const ch = chart(id);
   if (!ch) return;
-  ch.setOption({ textStyle: baseText, animationDuration: 700, animationEasing: 'cubicOut', ...option }, true);
+  const o = { textStyle: baseText, animationDuration: 800, animationEasing: 'cubicOut', ...option };
+  const m = isMobile();
+  if (o.grid) {
+    o.grid = { ...o.grid, containLabel: true, left: m ? 10 : Math.min(o.grid.left ?? 10, 12), right: m ? Math.min(o.grid.right ?? 10, 40) : o.grid.right };
+  }
+  const fixAxis = (ax) => {
+    if (!ax || Array.isArray(ax)) return ax;
+    if (m && ax.name) ax.nameTextStyle = { ...ax.nameTextStyle, align: ax.nameLocation === 'middle' ? 'center' : 'left', fontSize: 10 };
+    if (ax.type === 'category' && m) {
+      const f0 = ax.axisLabel?.formatter;
+      ax.axisLabel = { ...ax.axisLabel, fontSize: 10, width: 110, overflow: 'truncate', formatter: (v, i) => { const x = SHORT[v] || v; return typeof f0 === 'function' ? f0(x, i) : x; } };
+    }
+    return ax;
+  };
+  o.yAxis = fixAxis(o.yAxis); o.xAxis = fixAxis(o.xAxis);
+  if (m && o.legend && !o.legend.orient) o.legend = { ...o.legend, itemGap: 8, textStyle: { ...o.legend.textStyle, fontSize: 10 } };
+  if (m && Array.isArray(o.series)) o.series.forEach((x) => { if (x.endLabel) x.endLabel = { ...x.endLabel, show: false }; });
+  ch.setOption(o, true);
+  ch.off('click');
+  if (onClick) { ch.on('click', onClick); ch.getZr().setCursorStyle && null; }
+}
+// open a ticker in the screener from anywhere
+function openStock(t) {
+  if (!t || CASH_LIKE.has(t) || t === 'SNOXX') return;
+  show('screener');
+  analyze(t);
 }
 window.addEventListener('resize', () => Object.values(charts).forEach((c) => c && !c.isDisposed() && c.resize()));
 const emptyChart = (id, msg) => { if (charts[id]) { charts[id].dispose(); delete charts[id]; } document.getElementById(id).innerHTML = `<div class="skeleton">${msg}</div>`; };
@@ -206,8 +234,7 @@ function renderStatus() {
 // ======================================================================
 function renderOverview() {
   const c = calc;
-  const [whole, cents] = fmt.usdC(c.total).split('.');
-  $('#heroValue').innerHTML = `${whole}<span class="cents">.${cents}</span>`;
+  countUp($('#heroValue'), c.total, (v) => { const [w, ct] = fmt.usdC(v).split('.'); return `${w}<span class="cents">.${ct}</span>`; });
   const dc = $('#heroChg');
   dc.className = 'chg ' + (c.dayGl >= 0 ? 'up' : 'down');
   dc.textContent = `${c.dayGl >= 0 ? '▲' : '▼'} ${fmt.usd(Math.abs(c.dayGl))} (${fmt.spct(c.dayPct, 2)}) today`;
@@ -217,7 +244,7 @@ function renderOverview() {
     <div>Cost basis<b class="num">${fmt.usd(c.costBasis)}</b></div>
     <div>Unrealized gain<b class="num ${cls(c.unrealized)}">${fmt.usd(c.unrealized)} · ${fmt.spct(c.unrealizedPct)}</b></div>
     <div>Positions<b class="num">${c.rows.length}</b></div>
-    <div>As of<b>${S.live ? 'Live (delayed)' : S.base.meta?.asOf || '—'}</b></div>`;
+    <div>As of<b>${asOfLabel()}</b></div>`;
 
   // asset mix donut (direct labels → identity isn't color-alone)
   const mix = [
@@ -272,8 +299,9 @@ function renderOverview() {
 
   // Movers
   const movers = c.rows.filter((r) => r.dayChg != null && r.assetClass === 'Equity').sort((a, b) => b.dayChg - a.dayChg);
-  const li = (r) => `<div class="list-item"><div><span class="tk" style="font-weight:800">${r.ticker}</span> <span style="color:var(--muted);font-size:12px">${esc(r.name).slice(0, 26)}</span></div><div class="num ${cls(r.dayChg)}" style="font-weight:700">${fmt.spct(r.dayChg, 2)}</div></div>`;
+  const li = (r) => `<div class="list-item clickable" data-open="${r.ticker}" title="Analyze ${r.ticker}"><div><span class="tk" style="font-weight:800">${r.ticker}</span> <span style="color:var(--muted);font-size:12px">${esc(r.name).slice(0, 26)}</span></div><div class="num ${cls(r.dayChg)}" style="font-weight:700">${fmt.spct(r.dayChg, 2)}</div></div>`;
   $('#movers').innerHTML = `<h3>Leaders</h3><div class="list">${movers.slice(0, 5).map(li).join('')}</div><h3 style="margin-top:14px">Laggards</h3><div class="list">${movers.slice(-5).reverse().map(li).join('')}</div>`;
+  $$('#movers [data-open]').forEach((el) => el.addEventListener('click', () => openStock(el.dataset.open)));
 
   // Top 10
   const top = [...c.rows].filter((r) => r.assetClass === 'Equity').sort((a, b) => b.value - a.value).slice(0, 10).reverse();
@@ -284,7 +312,7 @@ function renderOverview() {
     yAxis: { type: 'category', data: top.map((r) => r.ticker), ...axisCommon, splitLine: { show: false }, axisLabel: { color: C.ink, fontWeight: 700 } },
     series: [{ type: 'bar', data: top.map((r) => r.weight), barWidth: '58%', itemStyle: { color: C.gold, borderRadius: [0, 4, 4, 0] },
       label: { show: true, position: 'right', color: C.ink2, formatter: (p) => fmt.pct(p.value, 1) } }],
-  });
+  }, (p) => openStock(top[p.dataIndex]?.ticker));
   renderSectorBars('chSectorOv', 'equity');
 }
 
@@ -322,7 +350,10 @@ async function renderPerfChart() {
     if (S.perfRange !== r || S.view !== 'overview') return;
     if (!S.longLoaded) { $('#perfStats').innerHTML = '<span class="down">Couldn\'t load long-term history. Make sure the latest market.mjs is deployed.</span>'; return; }
   }
-  const bt = windowBacktest(calc, long ? S.long : S.market, rf(), rangeStart(r), long ? 52 : 252);
+  $$('#perfBasis button').forEach((b) => b.classList.toggle('on', b.dataset.v === S.perfBasis));
+  const asHeld = S.perfBasis === 'held';
+  const mkt = long ? S.long : S.market;
+  const bt = asHeld ? windowAsHeld(calc, mkt, rangeStart(r)) : windowBacktest(calc, mkt, rf(), rangeStart(r), long ? 52 : 252);
   if (!bt) { emptyChart('chPerf', 'Not enough data for this period'); return; }
   const label = { '1M': 'past month', '3M': 'past 3 months', '6M': 'past 6 months', YTD: 'year to date', '1Y': 'past year', '3Y': 'past 3 years', '5Y': 'past 5 years' }[r];
   $('#perfTitle').textContent = `SMIF vs S&P 500 — ${label}`;
@@ -332,7 +363,16 @@ async function renderPerfChart() {
     <span>S&amp;P 500 <b class="${cls(bt.benchRet)}">${fmt.spct(bt.benchRet)}</b></span>
     <span>Difference <b class="${cls(diff)}">${fmt.pts(diff)}</b></span>
     ${bt.smifAnn != null ? `<span>Annualized <b>${fmt.spct(bt.smifAnn)}</b> vs <b>${fmt.spct(bt.benchAnn)}</b></span>` : ''}`;
-  const notes = ["Backtest of today's holdings at today's weights, rebased to 100 — not the fund's actual past returns."];
+  const notes = asHeld
+    ? ['Estimate: each stock counts only from the date we first bought it (new buys are treated as money added, not gains). Uses current share counts and excludes cash and positions we have since sold, so it won\'t exactly match the custodian statement.']
+    : ["Today's holdings at today's weights applied to the whole period — shows how the current portfolio would have done, not the fund's actual returns."];
+  if (asHeld && bt.entered.length) {
+    const recent = bt.entered.filter((e) => e.date >= bt.dates[0]);
+    const byDate = {};
+    recent.forEach((e) => (byDate[e.date] = byDate[e.date] || []).push(e.ticker));
+    const parts = Object.entries(byDate).map(([d, t]) => `${d}: ${t.join(', ')}`);
+    if (parts.length) notes.push(`Added during this period — ${parts.join(' · ')}.`);
+  }
   if (bt.partial.length) notes.push(`Shorter history (treated as flat before it existed): ${bt.partial.join(', ')}.`);
   if (bt.missing.length) notes.push(`No data: ${bt.missing.join(', ')}.`);
   if (long) notes.push('Weekly prices.');
@@ -354,6 +394,43 @@ async function renderPerfChart() {
         endLabel: { show: true, color: C.ink2, formatter: (p) => `SPY ${fmt.spct(p.value / 100 - 1)}` } },
     ],
   });
+}
+
+function asOfLabel() {
+  const now = S.live && S.fetchedAt ? S.fetchedAt : new Date();
+  const date = now.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  if (S.live) return `${date} · ${now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZoneName: 'short' })}`;
+  return `${date} <span style="color:var(--muted);font-size:12px;font-weight:500">(workbook prices)</span>`;
+}
+
+// animated number roll-up (runs once per element, then just sets the value)
+function countUp(el, to, render, ms = 1100) {
+  if (!el) return;
+  const from = el._v ?? (el._v === undefined ? to * 0.6 : to);
+  el._v = to;
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches || Math.abs(from - to) < 1e-9) { el.innerHTML = render(to); return; }
+  const t0 = performance.now();
+  cancelAnimationFrame(el._raf);
+  const step = (now) => {
+    const k = Math.min(1, (now - t0) / ms), e = 1 - Math.pow(1 - k, 4);
+    el.innerHTML = render(from + (to - from) * e);
+    if (k < 1) el._raf = requestAnimationFrame(step);
+  };
+  el._raf = requestAnimationFrame(step);
+}
+
+// ticker tape across the header — click any name to analyze it
+function renderTape() {
+  const tape = $('#tape');
+  const rows = calc.rows.filter((r) => r.assetClass === 'Equity' && r.dayChg != null).sort((a, b) => b.weight - a.weight);
+  if (!rows.length) { tape.classList.add('hidden'); return; }
+  tape.classList.remove('hidden');
+  const spy = S.live ? S.stats.SPY?.periods?.['1D'] : S.base.benchmark?.snapshot?.SPY?.change;
+  const item = (t, px, ch) => `<button class="tape-item" data-open="${t}"><b>${t}</b><span>${px}</span><span class="${cls(ch)}">${ch >= 0 ? '▲' : '▼'} ${fmt.spct(ch, 2).replace('+', '')}</span></button>`;
+  const head = `<button class="tape-item" data-open=""><b style="color:var(--gold)">SMIF</b><span class="${cls(calc.dayPct)}">${fmt.spct(calc.dayPct, 2)}</span></button>` + (spy != null ? `<button class="tape-item" data-open="SPY"><b>S&amp;P 500</b><span class="${cls(spy)}">${fmt.spct(spy, 2)}</span></button>` : '');
+  const html = head + rows.map((r) => item(r.ticker, fmt.usdC(r.price), r.dayChg)).join('');
+  $('#tapeTrack').innerHTML = html + html; // doubled for a seamless loop
+  $$('#tapeTrack [data-open]').forEach((b) => b.addEventListener('click', () => b.dataset.open ? openStock(b.dataset.open) : show('overview')));
 }
 
 function sectorData(basis) {
@@ -406,14 +483,15 @@ function renderAllocation() {
     } },
     series: [{
       type: 'treemap', roam: false, nodeClick: false, breadcrumb: { show: false }, width: '100%', height: '100%', top: 0, left: 0,
-      upperLabel: { show: true, height: 24, color: '#FFC629', fontWeight: 700, fontSize: 12, backgroundColor: 'transparent', formatter: (p) => (p.name ? `${p.name}  ${fmt.pct(p.value / calc.total)}` : '') },
-      label: { show: true, color: '#fff', fontWeight: 700, fontSize: 12, lineHeight: 15,
-        formatter: (p) => { const r = p.data.r; if (!r) return p.name; const v = mode === 'ret' ? r.ret : r.dayChg; return `${p.name}\n{s|${fmt.spct(v, mode === 'ret' ? 0 : 1)}}`; },
+      upperLabel: { show: true, height: isMobile() ? 20 : 24, color: '#FFC629', fontWeight: 700, fontSize: isMobile() ? 10 : 12, backgroundColor: 'transparent', overflow: 'truncate', ellipsis: '',
+        formatter: (p) => (p.name ? `${shortName(p.name)}  ${fmt.pct(p.value / calc.total, isMobile() ? 0 : 1)}` : '') },
+      label: { show: true, color: '#fff', fontWeight: 700, fontSize: isMobile() ? 10 : 12, lineHeight: isMobile() ? 12 : 15, overflow: 'truncate', ellipsis: '',
+        formatter: (p) => { const r = p.data.r; if (!r) return p.name; const v = mode === 'ret' ? r.ret : r.dayChg; return isMobile() ? p.name : `${p.name}\n{s|${fmt.spct(v, mode === 'ret' ? 0 : 1)}}`; },
         rich: { s: { fontSize: 11, fontWeight: 500, color: 'rgba(255,255,255,0.85)' } } },
       levels: [{ itemStyle: { borderColor: '#0c0b0a', borderWidth: 4, gapWidth: 4 } }, { itemStyle: { gapWidth: 2 } }],
       data,
     }],
-  });
+  }, (p) => p.data?.r && openStock(p.data.r.ticker));
   renderSectorBars('chSector', S.secBasis);
   const d = sectorData('equity').map((x) => ({ ...x, diff: x.smif - x.spx })).sort((a, b) => a.diff - b.diff);
   const band = S.settings.band / 100;
@@ -464,14 +542,33 @@ function renderPerformance() {
   const sorted = [...rows].filter((r) => r[key] != null).sort((a, b) => b[key] - a[key]);
   $('#perfBarTitle').textContent = { ret: 'Return since purchase (%)', gl: 'Unrealized gain / loss ($)', ann: 'Annualized return (simple, as in the workbook)' }[mode];
   const f = mode === 'gl' ? (v) => fmt.usd(v) : (v) => fmt.spct(v, 0);
-  setChart('chPerfBar', {
-    grid: { left: 60, right: 20, top: 30, bottom: 60 },
-    tooltip: { ...tooltipBase, trigger: 'item', formatter: (p) => { const r = sorted[p.dataIndex]; return `<b>${r.ticker}</b> ${esc(r.name)}<br>Return: ${fmt.spct(r.ret)} · ${fmt.usd(r.gl)}<br>Avg cost ${fmt.usdC(r.avgCost)} → ${fmt.usdC(r.price)}<br>Held ${r.days} days (since ${r.purchaseDate})${mode === 'ann' && r.days < 180 ? '<br><i>Short holding — annualized figure is exaggerated</i>' : ''}`; } },
-    xAxis: { type: 'category', data: sorted.map((r) => r.ticker), ...axisCommon, splitLine: { show: false }, axisLabel: { color: C.ink2, rotate: 60, fontSize: 10, interval: 0 } },
-    yAxis: { type: 'value', ...axisCommon, axisLabel: { ...axisCommon.axisLabel, formatter: mode === 'gl' ? (v) => fmt.big(v) : (v) => fmt.pct(v, 0) } },
-    series: [{ type: 'bar', barMaxWidth: 22, data: sorted.map((r) => ({ value: r[key], itemStyle: { color: r[key] >= 0 ? C.up : C.down, borderRadius: r[key] >= 0 ? [4, 4, 0, 0] : [0, 0, 4, 4] } })),
-      label: { show: sorted.length <= 50, position: 'top', color: C.muted, fontSize: 9, formatter: (p) => (Math.abs(p.dataIndex - 0) < 3 || p.dataIndex > sorted.length - 4 ? f(p.value) : '') } }],
-  });
+  const tipFmt = (p) => { const r = sorted[p.dataIndex]; return `<b>${r.ticker}</b> ${esc(r.name)}<br>Return: ${fmt.spct(r.ret)} · ${fmt.usd(r.gl)}<br>Avg cost ${fmt.usdC(r.avgCost)} → ${fmt.usdC(r.price)}<br>Held ${r.days} days (since ${r.purchaseDate})${mode === 'ann' && r.days < 180 ? '<br><i>Short holding — annualized figure is exaggerated</i>' : ''}`; };
+  const valAxis = { type: 'value', ...axisCommon, axisLabel: { ...axisCommon.axisLabel, formatter: mode === 'gl' ? (v) => fmt.big(v) : (v) => fmt.pct(v, 0) } };
+  const barData = sorted.map((r) => ({ value: r[key], itemStyle: { color: r[key] >= 0 ? C.up : C.down } }));
+  const dom = document.getElementById('chPerfBar');
+  if (isMobile()) {
+    // phones: horizontal bars so every ticker label fits
+    dom.style.height = Math.max(420, sorted.length * 20 + 60) + 'px';
+    setChart('chPerfBar', {
+      grid: { left: 4, right: 52, top: 8, bottom: 24 },
+      tooltip: { ...tooltipBase, trigger: 'item', formatter: tipFmt, confine: true },
+      xAxis: valAxis,
+      yAxis: { type: 'category', data: sorted.map((r) => r.ticker), inverse: true, ...axisCommon, splitLine: { show: false }, axisLabel: { color: C.ink2, fontSize: 10, interval: 0 } },
+      series: [{ type: 'bar', barWidth: '62%', data: barData.map((d) => ({ ...d, itemStyle: { ...d.itemStyle, borderRadius: d.value >= 0 ? [0, 3, 3, 0] : [3, 0, 0, 3] } })),
+        label: { show: true, position: 'right', color: C.muted, fontSize: 9, formatter: (p) => f(p.value) } }],
+    }, (p) => openStock(sorted[p.dataIndex]?.ticker));
+  } else {
+    dom.style.height = '';
+    setChart('chPerfBar', {
+      grid: { left: 60, right: 20, top: 30, bottom: 60 },
+      tooltip: { ...tooltipBase, trigger: 'item', formatter: tipFmt },
+      xAxis: { type: 'category', data: sorted.map((r) => r.ticker), ...axisCommon, splitLine: { show: false }, axisLabel: { color: C.ink2, rotate: 60, fontSize: 10, interval: 0 } },
+      yAxis: valAxis,
+      series: [{ type: 'bar', barMaxWidth: 22, data: barData.map((d) => ({ ...d, itemStyle: { ...d.itemStyle, borderRadius: d.value >= 0 ? [4, 4, 0, 0] : [0, 0, 4, 4] } })),
+        label: { show: true, position: 'top', color: C.muted, fontSize: 9, formatter: (p) => (p.dataIndex < 3 || p.dataIndex > sorted.length - 4 ? f(p.value) : '') } }],
+    }, (p) => openStock(sorted[p.dataIndex]?.ticker));
+  }
+  chart('chPerfBar').resize();
 
   const sc = rows.filter((r) => r.days > 90 && r.cagr != null);
   setChart('chHoldScatter', {
@@ -602,7 +699,8 @@ function sortableTable(sel, cols, rows, defKey, defDir = -1) {
     const { k, d } = el._st;
     const data = [...rows].sort((a, b) => { const x = a[k], y = b[k]; if (x == null) return 1; if (y == null) return -1; return (typeof x === 'string' ? x.localeCompare(y) : x - y) * d; });
     el.innerHTML = `<thead><tr>${cols.map((c) => `<th data-k="${c.k}" class="${c.n ? 'n' : ''}">${c.l}${c.t ? ' ' + tip(c.t) : ''}${k === c.k ? `<span class="arr">${d > 0 ? '▲' : '▼'}</span>` : ''}</th>`).join('')}</tr></thead>
-      <tbody>${data.map((r) => `<tr>${cols.map((c) => `<td class="${c.n ? 'n' : ''}">${c.f(r)}</td>`).join('')}</tr>`).join('')}</tbody>`;
+      <tbody>${data.map((r) => `<tr${r.ticker && !CASH_LIKE.has(r.ticker) && r.ticker !== 'SNOXX' ? ` class="clickable" data-open="${r.ticker}"` : ''}>${cols.map((c) => `<td class="${c.n ? 'n' : ''}">${c.f(r)}</td>`).join('')}</tr>`).join('')}</tbody>`;
+    $$('tbody tr[data-open]', el).forEach((tr) => tr.addEventListener('click', (e) => { if (!e.target.closest('.tip, input, button, a')) openStock(tr.dataset.open); }));
     $$('th', el).forEach((th) => th.addEventListener('click', (e) => {
       if (e.target.classList.contains('tip')) return;
       const nk = th.dataset.k;
@@ -728,11 +826,11 @@ function renderStockCard(err) {
     <div><div class="row"><h2 style="font-size:24px">${esc(s.symbol)}</h2>${s.held ? `<span class="tag gold">In portfolio</span>` : ''}${s.spx ? `<span class="tag">S&amp;P 500 · ${fmt.pct(s.spx.weight, 2)}</span>` : ''}</div>
       <div style="color:var(--ink-2);margin-top:4px">${esc(s.name)}</div>
       <div style="color:var(--muted);font-size:12px;margin-top:2px">${esc(s.sector)}${s.industry ? ' · ' + esc(s.industry) : ''}${m?.exchange ? ' · ' + esc(m.exchange) : ''}</div></div>
-    <div style="text-align:right"><div class="px num">${s.price != null ? fmt.usdC(s.price) : '—'}</div>${day != null ? `<span class="chg ${day >= 0 ? 'up' : 'down'}">${fmt.spct(day, 2)} today</span>` : ''}
+    <div class="px-wrap"><div class="px num">${s.price != null ? fmt.usdC(s.price) : '—'}</div>${day != null ? `<span class="chg ${day >= 0 ? 'up' : 'down'}">${fmt.spct(day, 2)} today</span>` : ''}
       <div style="color:var(--muted);font-size:11px;margin-top:6px">${s.live ? 'Live (delayed) · Yahoo Finance' : s.held ? 'Snapshot price from workbook' : 'No live data'}</div></div></div>`;
   if (err && !s.live) h += `<div class="warn-box">⚠ Couldn't load market data for ${esc(s.symbol)} (${esc(err)}). ${s.held ? 'Using the workbook price.' : 'Enter a price manually in the trade panel to simulate.'}</div>`;
   if (!S.api && !s.held) h += `<div class="warn-box">Live data is available once the site is deployed with its server functions. For now, type a price manually in the trade panel.</div>`;
-  if (hr) h += `<div class="warn-box ok" style="margin-top:12px">We own <b>&nbsp;${fmt.n(hr.quantity, 2)} shares&nbsp;</b> worth ${fmt.usd(hr.value)} (${fmt.pct(hr.weight, 2)} of the fund) · avg cost ${fmt.usdC(hr.avgCost)} · ${fmt.spct(hr.ret)} since ${hr.purchaseDate}</div>`;
+  if (hr) h += `<div class="warn-box ok" style="margin-top:12px"><span>We own <b>${fmt.n(hr.quantity, 2)} shares</b> worth ${fmt.usd(hr.value)} (${fmt.pct(hr.weight, 2)} of the fund) · avg cost ${fmt.usdC(hr.avgCost)} · ${fmt.spct(hr.ret)} since ${hr.purchaseDate}</span></div>`;
   h += `<div id="chStock" class="chart short mt"></div>`;
   if (st) {
     h += `<div class="range52-wrap" style="margin:14px 0 4px"><div style="display:flex;justify-content:space-between;font-size:11px;color:var(--muted)"><span>52-wk low ${fmt.usdC(st.low52)}</span><span>52-week range ${tip(GLOSS.r52)}</span><span>high ${fmt.usdC(st.high52)}</span></div><div class="range52"><i style="left:${(pos52 ?? 0) * 100}%"></i></div></div>`;
@@ -1240,6 +1338,7 @@ function refreshAll(resetDraft) {
   recalc();
   if (resetDraft) S.draft = null;
   renderStatus();
+  renderTape();
   renderers[S.view]();
 }
 $$('#tabs button').forEach((b) => b.addEventListener('click', () => show(b.dataset.view)));
@@ -1248,6 +1347,7 @@ window.addEventListener('hashchange', () => show(location.hash.slice(1)));
 const seg = (id, key, fn) => $$(`#${id} button`).forEach((b) => b.addEventListener('click', () => { S[key] = b.dataset.v; $$(`#${id} button`).forEach((x) => x.classList.toggle('on', x === b)); fn(); }));
 seg('tmColor', 'tmColor', renderAllocation);
 seg('perfRange', 'perfRange', () => { store.set('perfRange', S.perfRange); renderPerfChart(); });
+seg('perfBasis', 'perfBasis', () => { store.set('perfBasis', S.perfBasis); renderPerfChart(); });
 seg('secBasis', 'secBasis', () => renderSectorBars('chSector', S.secBasis));
 seg('perfMode', 'perfMode', renderPerformance);
 $('#hSearch').addEventListener('input', renderHoldings);
@@ -1313,6 +1413,27 @@ $('#checkKey').addEventListener('click', async () => {
 });
 $('#resetLocal').addEventListener('click', () => { store.del('localPortfolio'); S.base = S.master || S.seed; S.source = S.master ? 'master' : 'seed'; refreshAll(true); toast('Local copy cleared'); });
 
+// cursor spotlight + gentle 3D tilt on cards (mouse/trackpad only)
+if (window.matchMedia('(hover: hover) and (pointer: fine)').matches && !window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+  document.addEventListener('pointermove', (e) => {
+    const card = e.target.closest?.('.card');
+    if (!card) return;
+    const r = card.getBoundingClientRect();
+    const x = e.clientX - r.left, y = e.clientY - r.top;
+    card.style.setProperty('--mx', x + 'px');
+    card.style.setProperty('--my', y + 'px');
+    if (card.classList.contains('tile') || card.classList.contains('tilt')) {
+      const rx = ((y / r.height) - 0.5) * -5, ry = ((x / r.width) - 0.5) * 5;
+      card.style.transform = `perspective(900px) rotateX(${rx}deg) rotateY(${ry}deg) translateY(-2px)`;
+    }
+  }, { passive: true });
+  document.addEventListener('pointerout', (e) => {
+    const card = e.target.closest?.('.card.tile, .card.tilt');
+    if (card && !card.contains(e.relatedTarget)) card.style.transform = '';
+  });
+}
+window.addEventListener('resize', () => { clearTimeout(window._rz); window._rz = setTimeout(() => { if (calc) renderers[S.view](); }, 250); });
+
 // ======================================================================
 // Boot
 // ======================================================================
@@ -1320,6 +1441,7 @@ $('#resetLocal').addEventListener('click', () => { store.del('localPortfolio'); 
   try {
     await loadPortfolio();
   } catch (e) {
+    $('#splash').classList.add('done');
     document.querySelector('main').innerHTML = `<div class="card"><div class="empty"><b>Couldn't load the portfolio</b>${esc(e.message)}</div></div>`;
     return;
   }
@@ -1329,6 +1451,8 @@ $('#resetLocal').addEventListener('click', () => { store.del('localPortfolio'); 
   $('#scrChips').innerHTML = [...(S.base.watchlist || []), ...(S.base.focusList || [])].map((t) => `<button class="chip" data-t="${t}">${t}</button>`).join('') || '<span style="color:var(--muted);font-size:12px">—</span>';
   $$('#scrChips .chip').forEach((c) => c.addEventListener('click', () => analyze(c.dataset.t)));
   show(location.hash.slice(1) || 'overview');
+  renderTape();
+  setTimeout(() => $('#splash').classList.add('done'), 350);
   await loadMarket();
   refreshAll();
   setInterval(async () => { if (!document.hidden && S.api) { await loadMarket(); refreshAll(); } }, 5 * 60 * 1000);
