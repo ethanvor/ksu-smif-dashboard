@@ -1,6 +1,6 @@
 // KSU SMIF Dashboard — app shell, data loading, views.
 import {
-  computePortfolio, symbolStats, portfolioStats, applyTrades, periodReturns, weightedBeta,
+  computePortfolio, symbolStats, portfolioStats, windowBacktest, applyTrades, periodReturns, weightedBeta,
   fmt, cls, toGics, SECTORS, CASH_LIKE,
 } from './analytics.js';
 
@@ -31,7 +31,8 @@ const S = {
   rfAuto: null,
   settings: { maxPos: 10, band: 5, name: '', ...store.get('settings', {}) },
   view: 'overview',
-  tmColor: 'ret', secBasis: 'equity', perfMode: 'ret',
+  tmColor: 'ret', secBasis: 'equity', perfMode: 'ret', perfRange: store.get('perfRange', '1Y'),
+  long: {}, longLoaded: false, longLoading: null,
   trades: [],
   stock: null,         // screener current stock
   trade: { side: 'buy', mode: 'shares' },
@@ -150,11 +151,18 @@ async function loadMarket() {
   if (!S.api) { S.live = false; return; }
   try {
     const syms = [...allSymbols(), 'SPY', '^IRX'];
-    const chunks = [];
-    for (let i = 0; i < syms.length; i += 40) chunks.push(syms.slice(i, i + 40));
-    const res = await Promise.all(chunks.map((c) => getJSON(`/api/market?symbols=${encodeURIComponent(c.join(','))}&range=1y`, {}, 30000)));
+    // Small batches in parallel: each server function must finish in ~10s, so don't ask one for 40 tickers.
+    const chunks = [['SPY', '^IRX']];
+    const rest = syms.filter((s) => s !== 'SPY' && s !== '^IRX');
+    for (let i = 0; i < rest.length; i += 6) chunks.push(rest.slice(i, i + 6));
+    const res = await Promise.allSettled(chunks.map((c) => getJSON(`/api/market?symbols=${encodeURIComponent(c.join(','))}&range=1y`, {}, 25000)));
     let ok = 0;
-    res.forEach((r) => r.data.forEach((d) => { if (d && !d.error && d.closes?.length) { S.market[d.symbol.toUpperCase()] = d; ok++; } }));
+    const failed = [];
+    res.forEach((r, i) => {
+      if (r.status !== 'fulfilled') { failed.push(...chunks[i]); console.warn('Batch failed', chunks[i], r.reason?.message); return; }
+      r.value.data.forEach((d) => { if (d && !d.error && d.closes?.length) { S.market[d.symbol.toUpperCase()] = d; ok++; } else if (d) failed.push(d.symbol); });
+    });
+    if (failed.length) console.warn('No live data for:', failed.join(', '));
     const irx = S.market['^IRX'];
     if (irx && irx.price > 0 && irx.price < 20) S.rfAuto = irx.price / 100; // 13-week T-bill yield
     S.live = ok > 2 && !!S.market.SPY;
@@ -238,27 +246,7 @@ function renderOverview() {
 
   // Performance chart
   if (S.live && ps) {
-    const { dates, rets, bench } = ps.series;
-    let a = 100, b = 100;
-    const sa = [], sb = [];
-    rets.forEach((r, i) => { a *= 1 + r; b *= 1 + bench[i]; sa.push(+a.toFixed(2)); sb.push(+b.toFixed(2)); });
-    $('#perfTitle').textContent = 'SMIF vs S&P 500 — past year';
-    $('#perfHint').textContent = "Today's holdings held for 1 year, rebased to 100";
-    setChart('chPerf', {
-      grid: { left: 44, right: 70, top: 20, bottom: 30 },
-      tooltip: { ...tooltipBase, trigger: 'axis', axisPointer: { type: 'line', lineStyle: { color: C.gold, opacity: 0.5 } },
-        formatter: (p) => `<b>${p[0].axisValue}</b><br>` + p.map((x) => `${x.marker} ${x.seriesName}: ${x.value} (${fmt.spct(x.value / 100 - 1)})`).join('<br>') },
-      legend: { top: 0, right: 0, textStyle: { color: C.ink2 }, icon: 'roundRect', itemWidth: 12, itemHeight: 3 },
-      xAxis: { type: 'category', data: dates, ...axisCommon, splitLine: { show: false }, axisLabel: { ...axisCommon.axisLabel, formatter: (v) => v.slice(5) } },
-      yAxis: { type: 'value', scale: true, ...axisCommon },
-      series: [
-        { name: 'SMIF', type: 'line', data: sa, showSymbol: false, lineStyle: { width: 2, color: C.gold }, itemStyle: { color: C.gold },
-          areaStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [{ offset: 0, color: 'rgba(255,198,41,0.25)' }, { offset: 1, color: 'rgba(255,198,41,0)' }]) },
-          endLabel: { show: true, color: C.ink, formatter: (p) => `SMIF ${fmt.spct(p.value / 100 - 1)}` } },
-        { name: 'S&P 500 (SPY)', type: 'line', data: sb, showSymbol: false, lineStyle: { width: 2, color: C.grayLight }, itemStyle: { color: C.grayLight },
-          endLabel: { show: true, color: C.ink2, formatter: (p) => `SPY ${fmt.spct(p.value / 100 - 1)}` } },
-      ],
-    });
+    renderPerfChart();
   } else {
     // Snapshot: weighted SMIF return over each period from the Stock History tab
     const per = ['1D', '5D', '1M', '3M', '6M', 'YTD', '1Y'];
@@ -269,7 +257,9 @@ function renderOverview() {
       return w ? +(r / w).toFixed(4) : null;
     });
     $('#perfTitle').textContent = 'SMIF return by period';
-    $('#perfHint').textContent = 'Weighted by current holdings · workbook snapshot';
+    $('#perfHint').textContent = 'Weighted by current holdings · workbook snapshot. Live data enables the period selector and S&P comparison.';
+    $('#perfRange').style.display = 'none';
+    $('#perfStats').innerHTML = '';
     setChart('chPerf', {
       grid: { left: 50, right: 20, top: 30, bottom: 30 },
       tooltip: { ...tooltipBase, trigger: 'axis', axisPointer: { type: 'shadow' }, valueFormatter: (v) => fmt.spct(v) },
@@ -296,6 +286,74 @@ function renderOverview() {
       label: { show: true, position: 'right', color: C.ink2, formatter: (p) => fmt.pct(p.value, 1) } }],
   });
   renderSectorBars('chSectorOv', 'equity');
+}
+
+// ---------- Overview performance chart with selectable period ----------
+function rangeStart(r) {
+  const d = new Date();
+  const back = { '1M': [0, 1], '3M': [0, 3], '6M': [0, 6], '1Y': [1, 0], '3Y': [3, 0], '5Y': [5, 0] }[r];
+  if (r === 'YTD') return `${d.getFullYear() - 1}-12-31`;
+  d.setFullYear(d.getFullYear() - back[0]);
+  d.setMonth(d.getMonth() - back[1]);
+  return d.toISOString().slice(0, 10);
+}
+async function loadLongHistory() {
+  if (S.longLoaded) return;
+  if (S.longLoading) return S.longLoading;
+  const syms = [...allSymbols(), 'SPY'];
+  const chunks = [];
+  for (let i = 0; i < syms.length; i += 6) chunks.push(syms.slice(i, i + 6));
+  S.longLoading = Promise.allSettled(chunks.map((c) => getJSON(`/api/market?symbols=${encodeURIComponent(c.join(','))}&range=5y&interval=1wk`, {}, 25000)))
+    .then((res) => {
+      res.forEach((r) => { if (r.status === 'fulfilled') r.value.data.forEach((d) => { if (d && !d.error && d.closes?.length) S.long[d.symbol.toUpperCase()] = d; }); });
+      S.longLoaded = !!S.long.SPY;
+      S.longLoading = null;
+    });
+  return S.longLoading;
+}
+async function renderPerfChart() {
+  const r = S.perfRange;
+  $('#perfRange').style.display = '';
+  $$('#perfRange button').forEach((b) => b.classList.toggle('on', b.dataset.v === r));
+  const long = r === '3Y' || r === '5Y';
+  if (long && !S.longLoaded) {
+    $('#perfStats').innerHTML = '<span>Loading 5 years of weekly prices…</span>';
+    await loadLongHistory();
+    if (S.perfRange !== r || S.view !== 'overview') return;
+    if (!S.longLoaded) { $('#perfStats').innerHTML = '<span class="down">Couldn\'t load long-term history. Make sure the latest market.mjs is deployed.</span>'; return; }
+  }
+  const bt = windowBacktest(calc, long ? S.long : S.market, rf(), rangeStart(r), long ? 52 : 252);
+  if (!bt) { emptyChart('chPerf', 'Not enough data for this period'); return; }
+  const label = { '1M': 'past month', '3M': 'past 3 months', '6M': 'past 6 months', YTD: 'year to date', '1Y': 'past year', '3Y': 'past 3 years', '5Y': 'past 5 years' }[r];
+  $('#perfTitle').textContent = `SMIF vs S&P 500 — ${label}`;
+  const diff = bt.smifRet - bt.benchRet;
+  $('#perfStats').innerHTML = `
+    <span>SMIF <b class="${cls(bt.smifRet)}">${fmt.spct(bt.smifRet)}</b></span>
+    <span>S&amp;P 500 <b class="${cls(bt.benchRet)}">${fmt.spct(bt.benchRet)}</b></span>
+    <span>Difference <b class="${cls(diff)}">${fmt.pts(diff)}</b></span>
+    ${bt.smifAnn != null ? `<span>Annualized <b>${fmt.spct(bt.smifAnn)}</b> vs <b>${fmt.spct(bt.benchAnn)}</b></span>` : ''}`;
+  const notes = ["Backtest of today's holdings at today's weights, rebased to 100 — not the fund's actual past returns."];
+  if (bt.partial.length) notes.push(`Shorter history (treated as flat before it existed): ${bt.partial.join(', ')}.`);
+  if (bt.missing.length) notes.push(`No data: ${bt.missing.join(', ')}.`);
+  if (long) notes.push('Weekly prices.');
+  $('#perfHint').textContent = notes.join(' ');
+  const short = r === '1M' || r === '3M';
+  setChart('chPerf', {
+    grid: { left: 44, right: 78, top: 20, bottom: 30 },
+    tooltip: { ...tooltipBase, trigger: 'axis', axisPointer: { type: 'line', lineStyle: { color: C.gold, opacity: 0.5 } },
+      formatter: (p) => `<b>${p[0].axisValue}</b><br>` + p.map((x) => `${x.marker} ${x.seriesName}: ${fmt.spct(x.value / 100 - 1)}`).join('<br>') },
+    legend: { top: 0, right: 0, textStyle: { color: C.ink2 }, icon: 'roundRect', itemWidth: 12, itemHeight: 3 },
+    xAxis: { type: 'category', data: bt.dates, ...axisCommon, splitLine: { show: false },
+      axisLabel: { ...axisCommon.axisLabel, formatter: (v) => (long ? v.slice(0, 7) : short ? v.slice(5) : v.slice(2, 7)) } },
+    yAxis: { type: 'value', scale: true, ...axisCommon },
+    series: [
+      { name: 'SMIF', type: 'line', data: bt.smif, showSymbol: false, lineStyle: { width: 2, color: C.gold }, itemStyle: { color: C.gold },
+        areaStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [{ offset: 0, color: 'rgba(255,198,41,0.25)' }, { offset: 1, color: 'rgba(255,198,41,0)' }]) },
+        endLabel: { show: true, color: C.ink, formatter: (p) => `SMIF ${fmt.spct(p.value / 100 - 1)}` } },
+      { name: 'S&P 500 (SPY)', type: 'line', data: bt.bench, showSymbol: false, lineStyle: { width: 2, color: C.grayLight }, itemStyle: { color: C.grayLight },
+        endLabel: { show: true, color: C.ink2, formatter: (p) => `SPY ${fmt.spct(p.value / 100 - 1)}` } },
+    ],
+  });
 }
 
 function sectorData(basis) {
@@ -1189,6 +1247,7 @@ $$('[data-go]').forEach((a) => a.addEventListener('click', (e) => { e.preventDef
 window.addEventListener('hashchange', () => show(location.hash.slice(1)));
 const seg = (id, key, fn) => $$(`#${id} button`).forEach((b) => b.addEventListener('click', () => { S[key] = b.dataset.v; $$(`#${id} button`).forEach((x) => x.classList.toggle('on', x === b)); fn(); }));
 seg('tmColor', 'tmColor', renderAllocation);
+seg('perfRange', 'perfRange', () => { store.set('perfRange', S.perfRange); renderPerfChart(); });
 seg('secBasis', 'secBasis', () => renderSectorBars('chSector', S.secBasis));
 seg('perfMode', 'perfMode', renderPerformance);
 $('#hSearch').addEventListener('input', renderHoldings);

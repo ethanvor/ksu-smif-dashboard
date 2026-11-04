@@ -196,6 +196,45 @@ export function portfolioSeries(calc, market, rf) {
   return { dates, rets, bench, covered: covered + cashW, missing };
 }
 
+/**
+ * Backtest today's weights over any window. `market` can hold daily or weekly series.
+ * Returns cumulative growth (index = 100 at start) for SMIF and SPY plus summary numbers.
+ */
+export function windowBacktest(calc, market, rf, startDate, periodsPerYear = 252) {
+  const spy = market.SPY;
+  if (!spy || !spy.dates?.length) return null;
+  let i0 = spy.dates.findIndex((d) => d >= startDate);
+  if (i0 < 0) return null;
+  const dates = spy.dates.slice(i0);
+  if (dates.length < 3) return null;
+  const spyR = dailyReturns(spy);
+  const cashW = (calc.cash + calc.mmValue) / calc.total;
+  const missing = [], partial = [];
+  const rets = new Array(dates.length).fill(0);
+  calc.rows.forEach((r) => {
+    if (r.assetClass === 'Money Market' || CASH_LIKE.has(r.ticker)) return;
+    const s = market[r.ticker];
+    if (!s || !s.dates?.length) { missing.push(r.ticker); return; }
+    if (s.dates[0] > dates[0]) partial.push(r.ticker); // listed/started after the window began
+    const dr = dailyReturns(s);
+    dates.forEach((d, k) => { if (k > 0) rets[k] += r.weight * (dr.get(d) ?? 0); });
+  });
+  let a = 100, b = 100;
+  const smif = [100], bench = [100];
+  for (let k = 1; k < dates.length; k++) {
+    a *= 1 + rets[k] + cashW * (rf / periodsPerYear);
+    b *= 1 + (spyR.get(dates[k]) ?? 0);
+    smif.push(+a.toFixed(3)); bench.push(+b.toFixed(3));
+  }
+  const years = (new Date(dates[dates.length - 1]) - new Date(dates[0])) / (365.25 * 86400000);
+  const ann = (g) => (years >= 1 ? Math.pow(g, 1 / years) - 1 : null);
+  return {
+    dates, smif, bench, missing, partial, years,
+    smifRet: a / 100 - 1, benchRet: b / 100 - 1,
+    smifAnn: ann(a / 100), benchAnn: ann(b / 100),
+  };
+}
+
 export function portfolioStats(calc, market, rf) {
   const ps = portfolioSeries(calc, market, rf);
   if (!ps) return null;
