@@ -1,4 +1,5 @@
-// GET /api/market?symbols=AAPL,MSFT,SPY&range=1y
+// GET /api/market?symbols=AAPL,MSFT,SPY&range=1y            (daily)
+// GET /api/market?symbols=AAPL,SPY&range=5y&interval=1wk    (weekly, for 3Y/5Y charts)
 // Returns latest price + daily adjusted-close history for each symbol.
 import { chart, cleanSymbol, json, pool } from '../lib/yahoo.mjs';
 
@@ -8,10 +9,11 @@ export default async (req) => {
   const u = new URL(req.url);
   const symbols = [...new Set((u.searchParams.get('symbols') || '').split(',').map(cleanSymbol).filter(Boolean))].slice(0, 80);
   const range = RANGES.has(u.searchParams.get('range')) ? u.searchParams.get('range') : '1y';
+  const interval = u.searchParams.get('interval') === '1wk' ? '1wk' : '1d';
   if (!symbols.length) return json({ error: 'Pass ?symbols=AAPL,MSFT' }, 400);
-  const data = await pool(symbols, 8, (s) => chart(s, range));
+  const data = await pool(symbols, 10, (s) => chart(s, range, interval));
   // Cache at the CDN for 5 minutes so 12 analysts opening the page don't hammer Yahoo.
-  return json({ range, fetchedAt: new Date().toISOString(), data }, 200, {
+  return json({ range, interval, fetchedAt: new Date().toISOString(), data }, 200, {
     'cache-control': 'public, max-age=60',
     'netlify-cdn-cache-control': 'public, s-maxage=300, stale-while-revalidate=600',
   });
